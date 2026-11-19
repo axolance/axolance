@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Dessine les cartes SVG animées du profil GitHub axolance.
 
+Mise en page inspirée des cartes « éditoriales » (grand titre, tuiles, graphe mensuel,
+heatmap), habillée avec la DA du portfolio : noir profond, un seul bleu #0055FF,
+DM Sans + mono en capitales espacées, apparition flou → net, lueur bleue et étoiles.
+
 Données : calendrier de contributions via l'API GraphQL (jeton dans GITHUB_TOKEN).
 Sans jeton (ou avec OFFLINE=1), relit data/contributions.json.
-STATIC=1 : produit l'état final de chaque animation (captures d'écran).
+STATIC=1 : état final de chaque animation (captures d'écran).
 
-Règle du dépôt : profil anonyme. Aucun nom réel, aucun nom de dépôt privé :
+Règle du dépôt : profil ANONYME. Aucun nom réel, aucun nom de dépôt privé :
 seuls des compteurs agrégés sortent de l'API.
 """
 from __future__ import annotations
@@ -14,9 +18,12 @@ import base64
 import datetime as dt
 import json
 import os
+import random
 import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
+
+from fontTools.ttLib import TTFont
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGIN = os.environ.get("PROFILE_LOGIN", "axolance")
@@ -24,18 +31,26 @@ STATIC = os.environ.get("STATIC") == "1"
 DATA = ROOT / "data" / "contributions.json"
 OUT = ROOT / "cards"
 
-# Palette de l'avatar : bleu nuit, branchies cyan → rose.
-BG, PANEL, LINE = "#0b1020", "#10172e", "#1e2a50"
-CYAN, PINK, TEXT, MUTED = "#5ee7ff", "#ff7ad9", "#e6ecff", "#8592c4"
-LEVELS = ["#151d3a", "#1b4a6b", "#2c86a8", "#4fc3e0", "#5ee7ff"]
+# Jetons du portfolio (design-tokens.json).
+BG, SURFACE, LINE = "#000000", "#0a0d14", "#1c2233"
+FG, MUTED, ACCENT, SOFT, OK = "#f2f4f8", "#8a93a6", "#0055ff", "#8fb3ff", "#34d399"
+HEAT = ["#151b2b", "#0b2a6b", "#0040c4", "#0055ff", "#8fb3ff"]
+MONTHS = ["jan", "fév", "mar", "avr", "mai", "jun", "jul", "aoû", "sep", "oct", "nov", "déc"]
 
-TAGLINE = "sysadmin · devops · homelab · ctf"
-TILES = [
-    ("infra", "infra", ["Proxmox · LXC · KVM", "Nomad · Consul · Vault", "Docker · Firecracker"], CYAN),
-    ("reseau", "réseau", ["Cisco · FortiGate", "VLAN · VyOS · Tailscale", "DNS · DHCP · PXE"], "#9b8cff"),
-    ("secu", "sécu", ["Hack The Box", "Linux · Active Directory", "durcissement · logs"], PINK),
+EYEBROW = ("HOMELAB", "Admin systèmes & cybersécurité")
+INTRO = ["Infra, DevOps et sécurité offensive.", "Je monte des labs, je les casse, je documente."]
+TERMINAL = [
+    ("cmd", "nomad status"),
+    ("ok", "consul", "Running"),
+    ("ok", "vault", "Unsealed"),
+    ("ok", "nomad", "Running"),
+    ("ok", "proxmox", "3/3 nodes up"),
 ]
-TILE_LINK = f"https://github.com/{LOGIN}?tab=repositories"
+TILES = [
+    ("infra", "INFRA", "Proxmox, Nomad", ["Consul, Vault, Firecracker,", "Docker. Tout en IaC."]),
+    ("reseau", "RÉSEAU", "VLAN → WAN", ["Cisco, FortiGate, VyOS,", "Tailscale, PXE."]),
+    ("secu", "SÉCU", "Hack The Box", ["Pentest, Active Directory,", "durcissement et logs."]),
+]
 
 
 # ---------------------------------------------------------------- données
@@ -60,7 +75,7 @@ def fetch() -> dict:
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         payload = json.load(r)
-    if "errors" in payload or not payload.get("data", {}).get("user"):
+    if "errors" in payload or not (payload.get("data") or {}).get("user"):
         raise SystemExit(f"Réponse GraphQL inattendue : {payload.get('errors')}")
     u = payload["data"]["user"]
     cal = u["contributionsCollection"]["contributionCalendar"]
@@ -81,10 +96,10 @@ def streaks(days: list) -> tuple[int, int]:
     for _, n in days:
         run = run + 1 if n else 0
         longest = max(longest, run)
-    current = 0
     rev = list(reversed(days))
-    if rev and rev[0][1] == 0:  # aujourd'hui pas encore commencé : on ne casse pas la série
+    if rev and rev[0][1] == 0:  # journée pas encore commencée : la série n'est pas cassée
         rev = rev[1:]
+    current = 0
     for _, n in rev:
         if not n:
             break
@@ -92,197 +107,321 @@ def streaks(days: list) -> tuple[int, int]:
     return current, longest
 
 
-def months(days: list) -> list[tuple[str, int]]:
+def by_month(days: list) -> list[tuple[str, int]]:
     acc: dict[str, int] = {}
     for d, n in days:
         acc[d[:7]] = acc.get(d[:7], 0) + n
-    keys = sorted(acc)[-12:]
-    return [(k, acc[k]) for k in keys]
+    return [(k, acc[k]) for k in sorted(acc)[-12:]]
 
 
-# ---------------------------------------------------------------- SVG
+_METRICS: dict[str, tuple] = {}
+
+
+def text_w(s: str, size: float, font: str = "sans-500", spacing: float = 0) -> float:
+    """Largeur réelle d'un texte, lue dans la table hmtx de la police embarquée."""
+    if font not in _METRICS:
+        f = TTFont(ROOT / f"fonts/{font}.woff")
+        _METRICS[font] = (f.getBestCmap(), f["hmtx"].metrics, f["head"].unitsPerEm)
+    cmap, hmtx, upm = _METRICS[font]
+    adv = sum(hmtx[cmap[ord(c)]][0] if ord(c) in cmap else upm * .5 for c in s)
+    return adv * size / upm + spacing * len(s)
+
+
+def fmt(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+# ---------------------------------------------------------------- briques SVG
 
 def b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode()
 
 
-FONTS = (
-    "@font-face{font-family:'Mono';font-weight:400;src:url(data:font/woff;base64,%s)}"
-    "@font-face{font-family:'Mono';font-weight:800;src:url(data:font/woff;base64,%s)}"
-) % (b64(ROOT / "fonts/mono-400.woff"), b64(ROOT / "fonts/mono-800.woff"))
+FONTS = "".join(
+    f"@font-face{{font-family:'{fam}';font-weight:{w};src:url(data:font/woff;base64,{b64(ROOT / f'fonts/{f}.woff')})}}"
+    for fam, w, f in [("Sans", 400, "sans-400"), ("Sans", 500, "sans-500"), ("Mono", 400, "mono-400")]
+)
 
+EASE = "cubic-bezier(.22,1,.36,1)"  # proche du ressort 200/60 du portfolio
 BASE_CSS = f"""
-text{{font-family:'Mono',ui-monospace,monospace;fill:{TEXT}}}
+text{{font-family:'Sans',system-ui,sans-serif;fill:{FG}}}
+.mono{{font-family:'Mono',ui-monospace,monospace;letter-spacing:.25em}}
+.code{{font-family:'Mono',ui-monospace,monospace}}
 .muted{{fill:{MUTED}}}
-.rise{{animation:rise .7s cubic-bezier(.2,.8,.2,1) both}}
-.pop{{animation:pop .5s cubic-bezier(.3,1.6,.5,1) both;transform-box:fill-box;transform-origin:center}}
-.grow{{animation:grow .8s cubic-bezier(.2,.8,.2,1) both;transform-box:fill-box;transform-origin:bottom}}
-.fade{{animation:fade .4s ease-out both}}
-.pulse{{animation:pulse 2.4s ease-in-out infinite;transform-box:fill-box;transform-origin:center}}
+.appear{{animation:appear .9s {EASE} both}}
+.fade{{animation:fade .5s ease-out both}}
+.grow{{animation:grow 1s {EASE} both;transform-box:fill-box;transform-origin:bottom}}
+.span{{animation:span 1.2s {EASE} both;transform-box:fill-box;transform-origin:center}}
+.drift{{animation:drift 14s ease-in-out infinite alternate}}
+.drift2{{animation:drift 18s ease-in-out infinite alternate-reverse}}
+.twinkle{{animation:twinkle 3s ease-in-out infinite}}
+.pulse{{animation:pulse 2.4s ease-out infinite;transform-box:fill-box;transform-origin:center}}
 .blink{{animation:blink 1s steps(1) infinite}}
-@keyframes rise{{from{{opacity:0;transform:translateY(12px)}}to{{opacity:1;transform:none}}}}
-@keyframes pop{{from{{opacity:0;transform:scale(.6)}}to{{opacity:1;transform:none}}}}
-@keyframes grow{{from{{transform:scaleY(0)}}to{{transform:none}}}}
+@keyframes appear{{from{{opacity:0;filter:blur(10px);transform:translateY(10px)}}to{{opacity:1;filter:blur(0);transform:none}}}}
 @keyframes fade{{from{{opacity:0}}to{{opacity:1}}}}
-@keyframes pulse{{0%,100%{{opacity:1;transform:none}}50%{{opacity:.35;transform:scale(1.8)}}}}
+@keyframes grow{{from{{transform:scaleY(0)}}to{{transform:none}}}}
+@keyframes span{{from{{transform:scaleX(0);opacity:0}}to{{transform:none;opacity:1}}}}
+@keyframes drift{{from{{transform:translate(-30px,10px)}}to{{transform:translate(40px,-14px)}}}}
+@keyframes twinkle{{0%,100%{{opacity:.15}}50%{{opacity:.9}}}}
+@keyframes pulse{{0%{{opacity:.8;transform:scale(1)}}100%{{opacity:0;transform:scale(3)}}}}
 @keyframes blink{{50%{{opacity:0}}}}
 @media (prefers-reduced-motion:reduce){{*{{animation:none!important}}}}
 """
 STATIC_CSS = "*{animation:none!important}"
 
+DEFS = f"""
+<linearGradient id="card" x1="0" y1="1" x2="0" y2="0">
+  <stop offset="0" stop-color="{ACCENT}" stop-opacity=".15"/><stop offset="1" stop-color="#616161" stop-opacity=".09"/>
+</linearGradient>
+<linearGradient id="hl" x1="0" x2="1"><stop offset="0" stop-color="{ACCENT}" stop-opacity="0"/>
+  <stop offset=".5" stop-color="{ACCENT}"/><stop offset="1" stop-color="{ACCENT}" stop-opacity="0"/></linearGradient>
+<linearGradient id="sep" x1="0" x2="1"><stop offset="0" stop-color="#fff" stop-opacity="0"/>
+  <stop offset=".5" stop-color="#fff" stop-opacity=".15"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<linearGradient id="shine" x1="0" x2="1"><stop offset="0" stop-color="#fff" stop-opacity="0"/>
+  <stop offset=".5" stop-color="#fff" stop-opacity=".07"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<filter id="blur40" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="40"/></filter>
+<filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+"""
 
-def svg(w: int, h: int, body: str, label: str) -> str:
+
+def svg(w: int, h: int, body: str, label: str, pad: int = 0) -> str:
+    """pad : marge transparente autour de la carte, pour l'espacer des voisines dans le README."""
     css = FONTS + BASE_CSS + (STATIC_CSS if STATIC else "")
+    W, H = w + 2 * pad, h + 2 * pad
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
-        f'width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" aria-label="{escape(label)}">'
-        f"<title>{escape(label)}</title><style>{css}</style>"
-        f'<defs><linearGradient id="gill" x1="0" x2="1" y1="0" y2="0">'
-        f'<stop offset="0" stop-color="{CYAN}"/><stop offset="1" stop-color="{PINK}"/></linearGradient></defs>'
-        f"{body}</svg>"
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="{-pad} {-pad} {W} {H}" '
+        f'role="img" aria-label="{escape(label)}"><title>{escape(label)}</title><style>{css}</style>'
+        f"<defs>{DEFS}</defs>{body}</svg>"
     )
 
 
-def d(seconds: float) -> str:
-    return f' style="animation-delay:{seconds:.2f}s"'
+def dl(s: float) -> str:
+    return f' style="animation-delay:{s:.2f}s"'
 
 
-def frame(w: int, h: int) -> str:
+def panel(x: float, y: float, w: float, h: float, cid: str) -> str:
+    """Carte du portfolio : surface, dégradé bleu par le bas, bord blanc 7 %, rayon 20."""
     return (
-        f'<rect x=".5" y=".5" width="{w-1}" height="{h-1}" rx="14" fill="{BG}" stroke="{LINE}"/>'
-        f'<rect x="24" y="0" width="{w-48}" height="2" rx="1" fill="url(#gill)" opacity=".9"/>'
+        f'<clipPath id="{cid}"><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="20"/></clipPath>'
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="20" fill="{SURFACE}"/>'
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="20" fill="url(#card)"/>'
+        f'<rect x="{x+.5}" y="{y+.5}" width="{w-1}" height="{h-1}" rx="19.5" fill="none" stroke="#fff" stroke-opacity=".07"/>'
     )
 
+
+def highlighter(x: float, y: float, w: float, delay: float) -> str:
+    return f'<rect x="{x}" y="{y}" width="{w}" height="1.5" fill="url(#hl)" class="span"{dl(delay)}/>'
+
+
+def shine(cid: str, x: float, y: float, w: float, h: float, begin: float) -> str:
+    if STATIC:
+        return ""
+    return (
+        f'<g clip-path="url(#{cid})"><rect x="{x - 160}" y="{y}" width="160" height="{h}" fill="url(#shine)" '
+        f'transform="skewX(-18)"><animateTransform attributeName="transform" type="translate" additive="sum" '
+        f'values="0 0;{w + 320} 0;{w + 320} 0" keyTimes="0;.35;1" dur="7s" begin="{begin}s" repeatCount="indefinite"/></rect></g>'
+    )
+
+
+def counter(x: float, y: float, value: int, attrs: str, begin: float) -> str:
+    """Compte depuis zéro avec des <set> SMIL (une valeur par image)."""
+    if STATIC or value <= 0:
+        return f'<text x="{x}" y="{y}" {attrs}>{escape(fmt(value))}</text>'
+    frames = 16
+    out = []
+    for k in range(frames + 1):
+        v = round(value * (1 - (1 - k / frames) ** 3))
+        t0 = begin + k * 0.05
+        end = "" if k == frames else f' end="{t0 + 0.05:.2f}s"'
+        fill = ' fill="freeze"' if k == frames else ""
+        out.append(
+            f'<text x="{x}" y="{y}" {attrs} opacity="0">{escape(fmt(v))}'
+            f'<set attributeName="opacity" to="1" begin="{t0:.2f}s"{end}{fill}/></text>'
+        )
+    return "".join(out)
+
+
+def stars(w: int, h: int, n: int, seed: int) -> str:
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        x, y, r = rnd.uniform(0, w), rnd.uniform(0, h), rnd.choice([.6, .8, 1, 1.2])
+        cls = ' class="twinkle"' + dl(rnd.uniform(0, 3)) if rnd.random() < .5 else ""
+        out.append(f'<circle cx="{x:.0f}" cy="{y:.0f}" r="{r}" fill="#fff" opacity=".5"{cls}/>')
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- cartes
 
 def hero(data: dict) -> str:
-    w, h = 1000, 250
-    name = LOGIN
-    # Reflet cyan → rose qui traverse le pseudo (SMIL : background-clip:text n'existe pas en SVG).
-    sweep = "" if STATIC else (
-        '<animateTransform attributeName="gradientTransform" type="translate" '
-        'values="-1 0;1 0" dur="4s" begin="1.2s" repeatCount="indefinite"/>'
+    w, h = 1000, 400
+    tag, label = EYEBROW
+    tag_w = len(tag) * 7.6 + 16
+    pill_w = tag_w + len(label) * 6.9 + 26
+    # Lueur « soie » : ellipses bleues floutées qui dérivent lentement.
+    silk = (
+        f'<g clip-path="url(#hc)"><g filter="url(#blur40)" opacity=".55">'
+        f'<g class="drift"><ellipse cx="760" cy="90" rx="360" ry="70" fill="{ACCENT}" transform="rotate(-14 760 90)"/></g>'
+        f'<g class="drift2"><ellipse cx="560" cy="330" rx="420" ry="46" fill="#0a2fa0" transform="rotate(-10 560 330)"/></g>'
+        f"</g></g>"
     )
-    # Frappe au clavier de la ligne de titre : un masque qui s'élargit par crans.
-    chars = len(TAGLINE) + 2  # « $ » + espace
-    cw = 13.2
-    typing = "" if STATIC else (
-        f'<animate attributeName="width" from="0" to="{chars*cw+4:.0f}" dur="{chars*0.055:.2f}s" '
-        f'begin="1s" fill="freeze" calcMode="discrete" '
-        f'values="{";".join(f"{i*cw:.1f}" for i in range(chars+1))}"/>'
+    title = f'<text x="44" y="214" font-size="108" font-weight="500" letter-spacing="-2" class="appear"{dl(.35)}>{escape(LOGIN)}</text>'
+    intro = "".join(
+        f'<text x="48" y="{262 + i * 26}" font-size="17" class="muted appear"{dl(.6 + i * .08)}>{escape(t)}</text>'
+        for i, t in enumerate(INTRO)
     )
-    start_w = f"{chars*cw+4:.0f}" if STATIC else "0"
-    cursor_x = 250 + chars * cw + 4
-    body = frame(w, h) + f"""
-<defs>
-  <linearGradient id="sheen" x1="0" x2="1" y1="0" y2="0">
-    <stop offset="0" stop-color="{TEXT}"/><stop offset=".42" stop-color="{TEXT}"/>
-    <stop offset=".5" stop-color="{CYAN}"/><stop offset=".56" stop-color="{PINK}"/>
-    <stop offset=".64" stop-color="{TEXT}"/><stop offset="1" stop-color="{TEXT}"/>{sweep}
-  </linearGradient>
-  <clipPath id="av"><circle cx="128" cy="125" r="80"/></clipPath>
-  <clipPath id="type"><rect x="248" y="140" width="{start_w}" height="30">{typing}</rect></clipPath>
-</defs>
-<g class="pop"{d(.1)}>
-  <circle cx="128" cy="125" r="86" fill="none" stroke="url(#gill)" stroke-width="3"/>
-  <image href="data:image/png;base64,{b64(ROOT / 'assets/avatar.png')}" x="48" y="45" width="160" height="160" clip-path="url(#av)"/>
-</g>
-<text x="248" y="118" font-size="64" font-weight="800" fill="url(#sheen)" class="rise"{d(.35)}>{escape(name)}</text>
-<g clip-path="url(#type)"><text x="250" y="162" font-size="22" class="muted"><tspan fill="{CYAN}">$ </tspan>{escape(TAGLINE)}</text></g>
-<rect x="{cursor_x:.0f}" y="144" width="11" height="22" fill="{PINK}" class="blink"/>
-<g class="rise"{d(1.0 + chars*0.055)}>
-  <circle cx="256" cy="200" r="5" fill="#3ee08f" class="pulse"/>
-  <circle cx="256" cy="200" r="5" fill="#3ee08f"/>
-  <text x="270" y="205" font-size="15" class="muted">en ligne · {data['total']} contribution{'s' if data['total'] > 1 else ''} cette année</text>
-</g>"""
-    return svg(w, h, body, f"{name} — {TAGLINE}")
-
-
-def tile(key: str, title: str, lines: list[str], color: str, i: int) -> str:
-    w, h = 324, 170
-    base = .15 + i * .15
-    rows = "".join(
-        f'<text x="24" y="{86 + n*26}" font-size="15" class="muted rise"{d(base + .25 + n*.1)}>{escape(t)}</text>'
-        for n, t in enumerate(lines)
+    ax, ay, aw, ah = 650, 44, 300, 300
+    photo = (
+        f'<g class="appear"{dl(.5)}>'
+        f'<clipPath id="ph"><rect x="{ax}" y="{ay}" width="{aw}" height="{ah}" rx="22"/></clipPath>'
+        f'<image href="data:image/jpeg;base64,{b64(ROOT / "assets/avatar.jpg")}" x="{ax}" y="{ay}" width="{aw}" height="{ah}" clip-path="url(#ph)" preserveAspectRatio="xMidYMid slice"/>'
+        f'<rect x="{ax+.5}" y="{ay+.5}" width="{aw-1}" height="{ah-1}" rx="21.5" fill="none" stroke="#fff" stroke-opacity=".12"/>'
+        f'<rect x="{ax+10}" y="{ay+10}" width="98" height="28" rx="14" fill="#000" fill-opacity=".55" stroke="#fff" stroke-opacity=".1"/>'
+        f'<circle cx="{ax+27}" cy="{ay+24}" r="4" fill="{OK}" class="pulse"/><circle cx="{ax+27}" cy="{ay+24}" r="4" fill="{OK}"/>'
+        f'<text x="{ax+39}" y="{ay+29}" font-size="13">en ligne</text></g>'
     )
-    body = frame(w, h) + f"""
-<g class="pop"{d(base)}><rect x="24" y="26" width="10" height="10" rx="2" fill="{color}"/></g>
-<text x="44" y="38" font-size="20" font-weight="800" fill="{color}" class="rise"{d(base + .05)}>{escape(title)}</text>
-<rect x="24" y="54" width="276" height="1" fill="{LINE}"/>
-{rows}"""
-    return svg(w, h, body, f"{title} : " + ", ".join(lines))
-
-
-def activity(data: dict) -> str:
-    w, h = 1000, 330
-    days = data["days"][-371:]
-    cur, best = streaks(data["days"])
-    mon = months(data["days"])
-    # Compteurs
-    stats = [
-        ("contributions / an", data["total"]),
-        ("série en cours", f"{cur} j"),
-        ("meilleure série", f"{best} j"),
-        ("dépôts publics", data["publicRepos"]),
+    tx, ty, tw, th = 560, 236, 300, 150
+    term = [
+        f'<g class="appear"{dl(.9)}>',
+        f'<rect x="{tx}" y="{ty}" width="{tw}" height="{th}" rx="12" fill="#0d1018" fill-opacity=".96" stroke="#fff" stroke-opacity=".1"/>',
+        f'<rect x="{tx}" y="{ty+28}" width="{tw}" height="1" fill="#fff" fill-opacity=".08"/>',
     ]
-    out = [frame(w, h)]
-    for i, (lab, val) in enumerate(stats):
-        x = 32 + i * 240
-        out.append(
-            f'<g class="rise"{d(.1 + i*.1)}><text x="{x}" y="58" font-size="30" font-weight="800" '
-            f'fill="url(#gill)">{escape(str(val))}</text>'
-            f'<text x="{x}" y="82" font-size="13" class="muted">{escape(lab)}</text></g>'
-        )
-    out.append(f'<rect x="32" y="102" width="936" height="1" fill="{LINE}"/>')
+    for i, c in enumerate(["#ff5f57", "#febc2e", "#28c840"]):
+        term.append(f'<circle cx="{tx+16+i*14}" cy="{ty+14}" r="4.5" fill="{c}"/>')
+    term.append(f'<text x="{tx+66}" y="{ty+18}" font-size="11" class="code muted">{LOGIN}@lab:~/infra</text></g>')
+    for i, line in enumerate(TERMINAL):
+        y = ty + 50 + i * 19
+        d0 = 1.4 + i * .32
+        if line[0] == "cmd":
+            body = f'<tspan fill="{FG}">$ {escape(line[1])}</tspan>'
+        else:
+            body = f'<tspan fill="{OK}">✔ </tspan><tspan fill="{SOFT}">{escape(line[1]):<8}</tspan><tspan fill="{OK}"> {escape(line[2])}</tspan>'
+        term.append(f'<text x="{tx+14}" y="{y}" font-size="12" class="code fade" xml:space="preserve"{dl(d0)}>{body}</text>')
+    cy = ty + 50 + len(TERMINAL) * 19
+    term.append(
+        f'<g class="fade"{dl(1.4 + len(TERMINAL) * .32)}><text x="{tx+14}" y="{cy}" font-size="12" class="code">$</text>'
+        f'<rect x="{tx+28}" y="{cy-10}" width="7" height="13" fill="{FG}" class="blink"/></g>'
+    )
+    body = (
+        f'<clipPath id="hc"><rect width="{w}" height="{h}" rx="20"/></clipPath>'
+        f'<rect width="{w}" height="{h}" rx="20" fill="{BG}"/>{silk}'
+        f'<g clip-path="url(#hc)">{stars(w, h, 70, 7)}</g>'
+        f'<rect x=".5" y=".5" width="{w-1}" height="{h-1}" rx="19.5" fill="none" stroke="#fff" stroke-opacity=".07"/>'
+        f'<g class="appear"{dl(.15)}>'
+        f'<rect x="48" y="56" width="{pill_w:.0f}" height="30" rx="10" fill="#fff" fill-opacity=".06" stroke="#fff" stroke-opacity=".08"/>'
+        f'<rect x="53" y="61" width="{tag_w:.0f}" height="20" rx="6" fill="{ACCENT}"/>'
+        f'<text x="{53 + tag_w/2:.0f}" y="75" font-size="10" font-weight="500" text-anchor="middle" letter-spacing=".6">{tag}</text>'
+        f'<text x="{63 + tag_w:.0f}" y="76" font-size="13" class="muted">{escape(label)}</text>'
+        f"</g>{highlighter(56, 85, pill_w - 16, .6)}"
+        f"{title}{intro}{photo}{''.join(term)}"
+    )
+    return svg(w, h, body, f"{LOGIN}. {EYEBROW[1]}. {' '.join(INTRO)}", pad=6)
 
-    # Heatmap : 53 semaines × 7 jours, apparition colonne par colonne.
+
+def heatmap(data: dict) -> str:
+    w, h = 1000, 210
+    days = data["days"][-371:]
     first = dt.date.fromisoformat(days[0][0])
     pad = (first.weekday() + 1) % 7  # semaines GitHub : dimanche en haut
     cells = [None] * pad + days
     peak = max((n for _, n in days), default=0) or 1
-    size, gap = 11, 3
-    x0, y0 = 32, 124
+    size, gap = 13, 4
+    cols = (len(cells) + 6) // 7
+    x0 = (w - (cols * (size + gap) - gap)) / 2
+    y0 = 66
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%d.%m.%Y")
+    out = [panel(0, 0, w, h, "hm"),
+           f'<text x="48" y="44" font-size="11" class="mono muted appear"{dl(.1)}>CONTRIBUTIONS</text>',
+           f'<text x="{w-48}" y="44" font-size="11" class="mono muted appear" text-anchor="end"{dl(.15)}>MAJ {stamp}</text>']
     for idx, c in enumerate(cells):
         if c is None:
             continue
         col, row = divmod(idx, 7)
         n = c[1]
         lvl = 0 if n == 0 else min(4, 1 + int(3 * n / peak + .5))
+        x, y = x0 + col * (size + gap), y0 + row * (size + gap)
+        if lvl == 4:
+            out.append(f'<rect x="{x:.1f}" y="{y}" width="{size}" height="{size}" rx="3" fill="{ACCENT}" opacity=".7" filter="url(#glow)" class="fade"{dl(.3 + col*.022)}/>')
         out.append(
-            f'<rect x="{x0 + col*(size+gap)}" y="{y0 + row*(size+gap)}" width="{size}" height="{size}" rx="2" '
-            f'fill="{LEVELS[lvl]}" class="fade"{d(.4 + col*.015)}><title>{c[0]} : {n}</title></rect>'
+            f'<rect x="{x:.1f}" y="{y}" width="{size}" height="{size}" rx="3" '
+            f'fill="{HEAT[lvl]}" class="fade"{dl(.3 + col*.022)}><title>{c[0]} : {n}</title></rect>'
         )
+    return svg(w, h, "".join(out), "Graphe des contributions GitHub, mis à jour chaque jour", pad=6)
 
-    # Barres mensuelles à droite de la heatmap.
-    bx, by, bw, bh = 800, 124, 168, 98
-    mpeak = max((v for _, v in mon), default=0) or 1
+
+def activity(data: dict) -> str:
+    w, h = 1000, 340
+    days = data["days"]
+    mon = by_month(days)
+    cur, best = streaks(days)
+    active = sum(1 for _, n in days if n)
+    busiest = max((n for _, n in days), default=0)
+    out = [panel(0, 0, w, h, "ac")]
+    out.append(f'<text x="48" y="56" font-size="11" class="mono muted appear"{dl(.1)}>LES 12 DERNIERS MOIS SUR GITHUB</text>')
+    unit = "contribution" + ("s" if data["total"] > 1 else "")
+    big = 'font-size="58" font-weight="500" letter-spacing="-2"'
+    out.append(f'<g class="appear"{dl(.2)}>{counter(46, 116, data["total"], big, .3)}</g>')
+    num_w = 46 + text_w(fmt(data["total"]), 58, spacing=-2) + 16
+    out.append(f'<text x="{num_w}" y="116" {big} fill="{SOFT}" class="appear"{dl(.3)}>{unit}</text>')
+
+    bx, by, bw, bh = 48, 148, 560, 130
+    peak = max((v for _, v in mon), default=0) or 1
+    best_i = max(range(len(mon)), key=lambda i: mon[i][1]) if mon else -1
     step = bw / max(len(mon), 1)
     for i, (k, v) in enumerate(mon):
-        hh = max(2, bh * v / mpeak)
+        hh = max(4, bh * v / peak)
+        x = bx + i * step
+        top = i == best_i and v > 0
+        op = "1" if top else (".1" if i == len(mon) - 1 else ".18")
         out.append(
-            f'<rect x="{bx + i*step + 1:.1f}" y="{by + bh - hh:.1f}" width="{step-4:.1f}" height="{hh:.1f}" rx="2" '
-            f'fill="url(#gill)" class="grow"{d(.9 + i*.05)}><title>{k} : {v}</title></rect>'
+            f'<rect x="{x+4:.1f}" y="{by + bh - hh:.1f}" width="{step-10:.1f}" height="{hh:.1f}" rx="4" '
+            f'fill="{ACCENT if top else "#fff"}" fill-opacity="{op}" class="grow"{dl(.4 + i*.06)}><title>{k} : {v}</title></rect>'
         )
-    out.append(f'<text x="{bx}" y="{by + bh + 22}" font-size="12" class="muted">12 derniers mois</text>')
+        if top:
+            out.append(f'<rect x="{x+4:.1f}" y="{by + bh - hh:.1f}" width="{step-10:.1f}" height="{hh:.1f}" rx="4" fill="{ACCENT}" opacity=".5" filter="url(#glow)" class="fade"{dl(1.1)}/>')
+            out.append(f'<text x="{x + step/2 - 1:.1f}" y="{by + bh - hh - 10:.1f}" font-size="11" class="code fade" fill="{SOFT}" text-anchor="middle"{dl(1.2)}>{fmt(v)}</text>')
+        out.append(f'<text x="{x + step/2 - 1:.1f}" y="{by + bh + 24}" font-size="11" class="code muted" text-anchor="middle">{MONTHS[int(k[5:]) - 1]}</text>')
 
-    # Légende
-    ly = 250
-    out.append(f'<text x="32" y="{ly + 10}" font-size="12" class="muted">moins</text>')
-    for i, c in enumerate(LEVELS):
-        out.append(f'<rect x="{80 + i*16}" y="{ly}" width="11" height="11" rx="2" fill="{c}"/>')
-    out.append(f'<text x="{82 + 5*16}" y="{ly + 10}" font-size="12" class="muted">plus</text>')
-    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    out.append(f'<text x="968" y="300" font-size="12" class="muted" text-anchor="end">mis à jour le {stamp}</text>')
-    out.append(
-        f'<text x="32" y="300" font-size="13" class="muted">'
-        f'<tspan fill="{CYAN}">$</tspan> uptime --since {escape(data["createdAt"][:10])}</text>'
-    )
-    return svg(w, h, "".join(out), f"Activité GitHub : {data['total']} contributions sur un an")
+    sx = 680
+    stats = [
+        (cur, f" jour{'s' if cur > 1 else ''}", f"série en cours, record : {best}"),
+        (active, f" / {len(days)}", "jours avec une contribution"),
+        (busiest, "", "le jour le plus actif"),
+    ]
+    num = 'font-size="40" font-weight="500" letter-spacing="-1"'
+    for i, (v, suf, lab) in enumerate(stats):
+        y = 110 + i * 82
+        d0 = .5 + i * .15
+        out.append(f'<g class="appear"{dl(d0)}>{counter(sx, y, v, num, d0 + .1)}'
+                   f'<text x="{sx + text_w(fmt(v), 40, spacing=-1) + 6:.1f}" y="{y}" {num} fill="{MUTED}" xml:space="preserve">{escape(suf)}</text>'
+                   f'<text x="{sx}" y="{y + 24}" font-size="13" class="muted">{escape(lab)}</text></g>')
+        if i < 2:
+            out.append(f'<rect x="{sx}" y="{y + 44}" width="272" height="1" fill="url(#sep)"/>')
+    out.append(highlighter(48, h - 1.5, w - 96, 1.0))
+    return svg(w, h, "".join(out), f"{data['total']} contributions sur les 12 derniers mois", pad=6)
+
+
+def tile(key: str, cap: str, big: str, lines: list[str], i: int) -> str:
+    w, h = 333, 236
+    x, y, cw, ch = 6, 6, w - 12, h - 12
+    d0 = .15 + i * .12
+    out = [panel(x, y, cw, ch, f"t{key}")]
+    out.append(f'<text x="{x+26}" y="{y+40}" font-size="11" class="mono muted appear"{dl(d0)}>{escape(cap)}</text>')
+    out.append(f'<text x="{x+cw-26}" y="{y+41}" font-size="14" fill="{SOFT}" text-anchor="end" class="appear"{dl(d0 + .05)}>↗</text>')
+    out.append(f'<text x="{x+24}" y="{y+108}" font-size="34" font-weight="500" letter-spacing="-1" class="appear"{dl(d0 + .12)}>{escape(big)}</text>')
+    for n, t in enumerate(lines):
+        out.append(f'<text x="{x+26}" y="{y+146 + n*21}" font-size="14" class="muted appear"{dl(d0 + .22 + n*.06)}>{escape(t)}</text>')
+    out.append(shine(f"t{key}", x, y, cw, ch, 2 + i * .8))
+    out.append(highlighter(x + 30, y + ch - 1.5, cw - 60, d0 + .5))
+    return svg(w, h, "".join(out), f"{cap} : {big}. {' '.join(lines)}")
 
 
 def main() -> None:
     data = fetch()
     OUT.mkdir(exist_ok=True)
-    files = {"hero.svg": hero(data), "activity.svg": activity(data)}
+    for old in OUT.glob("*.svg"):
+        old.unlink()
+    files = {"hero.svg": hero(data), "heatmap.svg": heatmap(data), "activity.svg": activity(data)}
     for i, t in enumerate(TILES):
         files[f"{t[0]}.svg"] = tile(*t, i)
     for name, content in files.items():

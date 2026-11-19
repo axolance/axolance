@@ -27,6 +27,9 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Dépendances
+        run: pip install --quiet "fonttools==4.*"
+
       - name: Dessiner les cartes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
