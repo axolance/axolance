@@ -34,5 +34,5 @@ text{font-family:'Mono',ui-monospace,monospace;fill:#e6ecff}
 <g class="rise" style="animation-delay:2.92s">
   <circle cx="256" cy="200" r="5" fill="#3ee08f" class="pulse"/>
   <circle cx="256" cy="200" r="5" fill="#3ee08f"/>
-  <text x="270" y="205" font-size="15" class="muted">en ligne · 1 contribution cette année</text>
+  <text x="270" y="205" font-size="15" class="muted">en ligne · 3 contributions cette année</text>
 </g></svg>
