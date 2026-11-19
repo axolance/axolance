@@ -1,0 +1,42 @@
+name: Cartes du profil
+
+# Redessine les SVG du README chaque nuit à partir des contributions réelles.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["scripts/**", "fonts/**", "assets/**", ".github/workflows/cards.yml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cards
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Dessiner les cartes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/render.py
+
+      - name: Commiter si quelque chose a changé
+        run: |
+          git add cards data
+          if git diff --cached --quiet; then echo "Rien de neuf."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: cartes du profil à jour"
+          git push
